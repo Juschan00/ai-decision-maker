@@ -30,6 +30,7 @@ function errorMessage(e: unknown): { status: number; message: string } {
     if (e.status === 400 && /API key/i.test(e.message)) return { status: 401, message: "Gemini rejected the API key. Check GEMINI_API_KEY in .env." };
     if (e.status === 401 || e.status === 403) return { status: 401, message: "Gemini rejected the API key. Check GEMINI_API_KEY in .env." };
     if (e.status === 429) return { status: 429, message: "Gemini rate limit or quota hit. Try again in a moment." };
+    if (e.status === 503) return { status: 503, message: "Gemini is overloaded right now, even after retries and fallbacks. Try again in a minute." };
     if (e.status === 404) return { status: 502, message: `Gemini model not found. Set VERDICT_GEMINI_MODEL in .env. (${e.message})` };
     return { status: 502, message: `Gemini API error ${e.status}: ${e.message}` };
   }

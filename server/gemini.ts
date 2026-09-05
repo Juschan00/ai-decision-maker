@@ -11,18 +11,23 @@ import { PERSONA, decidePrompt, framePrompt } from "./prompts.ts";
 
 export { GeminiApiError };
 
-/** Newest-first preference list. The first one the key can actually see wins. */
-const PREFERRED = [
-  "gemini-3.5-pro",
-  "gemini-3.5-flash",
-  "gemini-3-pro",
-  "gemini-3-flash",
-  "gemini-3-pro-preview",
-  "gemini-3-flash-preview",
-  "gemini-2.5-pro",
-  "gemini-2.5-flash",
-];
 const FALLBACK_MODEL = "gemini-2.5-flash";
+
+/**
+ * Rank a model name for this app: newest version first, then pro > flash > flash-lite,
+ * with previews/experimental builds behind stable ones. Returns null for models that
+ * are not general text models (image, tts, transcribe, live, ...).
+ */
+function rankModel(name: string): number | null {
+  const m = /^gemini-(\d+(?:\.\d+)?)-(pro|flash-lite|flash)(?:-(.*))?$/.exec(name);
+  if (!m) return null;
+  const [, ver, tier, suffix = ""] = m;
+  if (/image|tts|audio|transcribe|embedding|live|robotics|computer|customtools|thinking/.test(suffix)) return null;
+  const tierScore = tier === "pro" ? 2 : tier === "flash" ? 1 : 0;
+  const stable = suffix === "" ? 1 : 0;
+  // version dominates, then stability, then tier
+  return Number(ver) * 100 + stable * 10 + tierScore;
+}
 
 export function hasGeminiCredentials(): boolean {
   return Boolean(process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY);
@@ -36,22 +41,26 @@ function getClient(): GoogleGenAI {
   return client;
 }
 
-let resolvedModel: Promise<string> | null = null;
+let candidates: Promise<string[]> | null = null;
 let resolvedForKey: string | undefined;
 let retryAfter = 0;
-/** Pick the best generateContent-capable model this key can see; cached per process and key. */
-export function resolveGeminiModel(): Promise<string> {
-  if (process.env.VERDICT_GEMINI_MODEL) return Promise.resolve(process.env.VERDICT_GEMINI_MODEL);
+
+/**
+ * Ordered list of models to try: the pinned one, or the preferred list filtered to what
+ * this key can see, followed by any newer text models we didn't anticipate. Cached per key.
+ */
+export function resolveGeminiCandidates(): Promise<string[]> {
+  if (process.env.VERDICT_GEMINI_MODEL) return Promise.resolve([process.env.VERDICT_GEMINI_MODEL, FALLBACK_MODEL]);
   const key = process.env.GEMINI_API_KEY ?? process.env.GOOGLE_API_KEY;
   if (key !== resolvedForKey) {
-    resolvedModel = null;
+    candidates = null;
     resolvedForKey = key;
     client = null;
     retryAfter = 0;
   }
-  if (!resolvedModel && Date.now() < retryAfter) return Promise.resolve(FALLBACK_MODEL);
-  if (!resolvedModel) {
-    resolvedModel = (async () => {
+  if (!candidates && Date.now() < retryAfter) return Promise.resolve([FALLBACK_MODEL]);
+  if (!candidates) {
+    candidates = (async () => {
       try {
         const available = new Set<string>();
         const pager = await getClient().models.list({ config: { pageSize: 200 } });
@@ -59,24 +68,30 @@ export function resolveGeminiModel(): Promise<string> {
           const name = (m.name ?? "").replace(/^models\//, "");
           if (!m.supportedActions || m.supportedActions.includes("generateContent")) available.add(name);
         }
-        const pick = PREFERRED.find((p) => available.has(p));
-        if (pick) return pick;
-        // Any gemini-3 or newer text model we didn't anticipate.
-        const newer = [...available]
-          .filter((n) => /^gemini-\d/.test(n) && !/image|tts|audio|embedding|live|robotics|computer-use/.test(n))
-          .sort()
-          .reverse();
-        return newer[0] ?? FALLBACK_MODEL;
+        const list = [...available]
+          .map((n) => ({ n, r: rankModel(n) }))
+          .filter((x): x is { n: string; r: number } => x.r !== null)
+          .sort((a, b) => b.r - a.r)
+          .map((x) => x.n);
+        console.log("[verdict gemini] model order:", list.slice(0, 5).join(" > "));
+        return list.length ? list : [FALLBACK_MODEL];
       } catch (e) {
-        resolvedModel = null; // retry discovery, but not more than once a minute
+        candidates = null; // retry discovery, but not more than once a minute
         retryAfter = Date.now() + 60_000;
         console.warn("[verdict gemini] model discovery failed, using", FALLBACK_MODEL, e instanceof Error ? e.message : e);
-        return FALLBACK_MODEL;
+        return [FALLBACK_MODEL];
       }
     })();
   }
-  return resolvedModel;
+  return candidates;
 }
+
+export async function resolveGeminiModel(): Promise<string> {
+  return (await resolveGeminiCandidates())[0];
+}
+
+const isTransient = (e: unknown) => e instanceof GeminiApiError && (e.status === 503 || e.status === 429 || e.status >= 500);
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Gemini accepts standard JSON Schema but not every keyword; strip the noisy ones. */
 function toGeminiSchema(schema: z.ZodType): unknown {
@@ -102,7 +117,24 @@ function thinkingConfigFor(model: string, level: "low" | "high"): ThinkingConfig
 }
 
 async function generateJson<T>(schema: z.ZodType<T>, prompt: string, thinking: "low" | "high"): Promise<T> {
-  const model = await resolveGeminiModel();
+  const models = await resolveGeminiCandidates();
+  let lastError: unknown;
+  for (const [i, model] of models.slice(0, 4).entries()) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        return await generateWith(model, schema, prompt, thinking);
+      } catch (e) {
+        lastError = e;
+        if (!isTransient(e)) throw e;
+        console.warn(`[verdict gemini] ${model} transient error (${(e as GeminiApiError).status}), ${attempt === 0 ? "retrying" : i < models.length - 1 ? "falling back" : "giving up"}`);
+        if (attempt === 0) await sleep(1500);
+      }
+    }
+  }
+  throw lastError;
+}
+
+async function generateWith<T>(model: string, schema: z.ZodType<T>, prompt: string, thinking: "low" | "high"): Promise<T> {
   const res = await getClient().models.generateContent({
     model,
     contents: prompt,

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { motion } from "motion/react";
 import type { Engine } from "../shared/schema.ts";
 import { ForkGraphic, MiniCoin, MiniMatrix, MiniRing, MiniScale } from "./LandingVisuals.tsx";
+import { QuickCoin } from "./QuickCoin.tsx";
 
 const EXAMPLES: { icon: string; short: string; full: string }[] = [
   { icon: "💼", short: "Quit for the side project", full: "Should I quit my job to go full-time on my side project?" },
@@ -36,6 +37,7 @@ export function Intake({
   error: string | null;
 }) {
   const [text, setText] = useState("");
+  const [mode, setMode] = useState<"describe" | "coin">("describe");
   const ready = text.trim().length > 8 && !busy;
 
   return (
@@ -56,6 +58,19 @@ export function Intake({
       </div>
 
       <motion.div {...rise(0.2)}>
+        <div className="mode-switch" role="tablist" aria-label="How do you want to decide?">
+          <button role="tab" aria-selected={mode === "describe"} className={mode === "describe" ? "on" : ""} onClick={() => setMode("describe")}>
+            Describe the decision
+          </button>
+          <button role="tab" aria-selected={mode === "coin"} className={mode === "coin" ? "on" : ""} onClick={() => setMode("coin")}>
+            Just flip a coin
+          </button>
+        </div>
+        {mode === "coin" ? (
+          <div className="dilemma-box coin-mode">
+            <QuickCoin onFullVerdict={(d) => { setText(d); onSubmit(d); }} />
+          </div>
+        ) : (
         <div className="dilemma-box">
           <textarea
             autoFocus
@@ -77,7 +92,9 @@ export function Intake({
             </button>
           </div>
         </div>
+        )}
         {error && <div className="error">{error}</div>}
+        {mode === "describe" && (
         <div className="chips" aria-label="Example decisions">
           {EXAMPLES.map((ex) => (
             <button key={ex.full} className={"chip" + (text === ex.full ? " active" : "")} onClick={() => setText(ex.full)} title={ex.full}>
@@ -86,6 +103,7 @@ export function Intake({
             </button>
           ))}
         </div>
+        )}
         {engine === "offline" && (
           <div className="note-pill" role="status">
             <span className="dot" />

@@ -122,7 +122,9 @@ async function generateJson<T>(schema: z.ZodType<T>, prompt: string, thinking: "
   for (const [i, model] of models.slice(0, 4).entries()) {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        return await generateWith(model, schema, prompt, thinking);
+        const out = await generateWith(model, schema, prompt, thinking);
+        console.log(`[verdict gemini] served by ${model}`);
+        return out;
       } catch (e) {
         lastError = e;
         if (!isTransient(e)) throw e;
